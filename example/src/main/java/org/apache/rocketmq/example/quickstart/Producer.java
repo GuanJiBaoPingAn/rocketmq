@@ -31,7 +31,8 @@ public class Producer {
         /*
          * Instantiate with a producer group name.
          */
-        DefaultMQProducer producer = new DefaultMQProducer("please_rename_unique_group_name");
+        DefaultMQProducer producer = new DefaultMQProducer("abc");
+        producer.setNamesrvAddr("localhost:9876");
 
         /*
          * Specify name server addresses.
@@ -49,6 +50,7 @@ public class Producer {
          * Launch the instance.
          */
         producer.start();
+        producer.setCreateTopicKey("AUTO_CREATE_TOPIC_KEY");
 
         for (int i = 0; i < 1000; i++) {
             try {

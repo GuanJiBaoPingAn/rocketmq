@@ -98,8 +98,12 @@ public class DefaultMQProducerImpl implements MQProducerInner {
     private final InternalLogger log = ClientLogger.getLog();
     private final Random random = new Random();
     private final DefaultMQProducer defaultMQProducer;
+
+    /** topic -> 路由信息缓存 */
     private final ConcurrentMap<String/* topic */, TopicPublishInfo> topicPublishInfoTable =
         new ConcurrentHashMap<String, TopicPublishInfo>();
+
+    /** 发送消息钩子 */
     private final ArrayList<SendMessageHook> sendMessageHookList = new ArrayList<SendMessageHook>();
     private final RPCHook rpcHook;
     private final BlockingQueue<Runnable> asyncSenderThreadPoolQueue;
@@ -175,6 +179,17 @@ public class DefaultMQProducerImpl implements MQProducerInner {
         this.start(true);
     }
 
+    /**
+     * Step 1：检查productGroup 是否符合要求；并改变生产者的instanceName 为进程ID
+     * Step 2：创建MQClientlnstance 实例。整个NM 实例中只存在一个MQClientManager 实例，维护一个MQClientInstance 缓存表
+     * ConcurrentMap<String, MQClientinstance> factoryTable, 也就是同一个clientId 只会创建一个MQClientInstance。
+     * Step 3：向MQClientlnstance 注册，将当前生产者加入到MQClientlnstance 管理中，方
+     * 便后续调用网络请求、进行心跳检测等。
+     * Step 4：启动MQClientInstance ，如果MQClientInstance 已经启动，则本次启动不会真正执行
+     *
+     * @param startFactory
+     * @throws MQClientException
+     */
     public void start(final boolean startFactory) throws MQClientException {
         switch (this.serviceState) {
             case CREATE_JUST:
@@ -685,6 +700,13 @@ public class DefaultMQProducerImpl implements MQProducerInner {
             null).setResponseCode(ClientErrorCode.NOT_FOUND_TOPIC_EXCEPTION);
     }
 
+    /**
+     * 查找主题的路由信息的方法。如果生产者中缓存了topic 的路由信息，如果该路由信息中包含了消息队列，
+     * 则直接返回该路由信息，如果没有缓存或没有包含消息队列， 则向NameServer 查询该topic 的路由信息。如果最终未找到路由信息，
+     * 则抛出异常： 无法找到主题相关路由信息异常。
+     * @param topic
+     * @return
+     */
     private TopicPublishInfo tryToFindTopicPublishInfo(final String topic) {
         TopicPublishInfo topicPublishInfo = this.topicPublishInfoTable.get(topic);
         if (null == topicPublishInfo || !topicPublishInfo.ok()) {
@@ -702,6 +724,32 @@ public class DefaultMQProducerImpl implements MQProducerInner {
         }
     }
 
+    /**
+     * 消息发送
+     * Step 1：根据MessageQueue 获取Broker 的网络地址。如果MQClientInstance 的brokerAddrTable 中未缓存该Broker 的信息，
+     * 则从NameServer 主动更新一下topic 的路由信息。如果路由更新后还是找不到Broker 信息，则抛出异常，提示Broker 不存在。
+     * Step 2：为消息分配全局唯一ID ，如果消息体默认超过4K(compressMsgBodyOverHowmuch), 会对消息体采用zip 压缩，并设置消息的系统
+     * 标记为MessageSysFlag.COMPRESSED_FLAG。如果是事务Prepared 消息，则设置消息的系统标记为
+     * MessageSysFlag.TRANSACTION_PREPARED_TYPE
+     * Step 3：如果注册了消息发送钩子函数， 则执行消息发送之前的增强逻辑。通过DefaultMQProducerlmpl#registerSendMessageHook 注册钩子处理类
+     * Step 4：构建消息发送请求包。主要包含如下重要信息：生产者组、主题名称、默认创建主题Key 、该主题在单个Broker 默认队列数、
+     * 队列ID （队列序号）、消息系统标记(MessageSysFlag ）、消息发送时间、消息标记（RocketMQ 对消息中的flag 不做任何处理，
+     * 供应用程序使用）、消息扩展属性、消息重试次数、是否是批量消息等
+     * Step 5：根据消息发送方式，同步、异步、单向方式进行网络传输
+     * Step 6：如果注册了消息发送钩子函数，执行after 逻辑
+     *
+     * @param msg 待发送消息
+     * @param mq 消息将发送到该消息队列上
+     * @param communicationMode
+     * @param sendCallback 异步消息回调函数
+     * @param topicPublishInfo 主题路由信息
+     * @param timeout 消息发送超时时间
+     * @return
+     * @throws MQClientException
+     * @throws RemotingException
+     * @throws MQBrokerException
+     * @throws InterruptedException
+     */
     private SendResult sendKernelImpl(final Message msg,
         final MessageQueue mq,
         final CommunicationMode communicationMode,
@@ -709,6 +757,7 @@ public class DefaultMQProducerImpl implements MQProducerInner {
         final TopicPublishInfo topicPublishInfo,
         final long timeout) throws MQClientException, RemotingException, MQBrokerException, InterruptedException {
         long beginStartTime = System.currentTimeMillis();
+        // step 1
         String brokerAddr = this.mQClientFactory.findBrokerAddressInPublish(mq.getBrokerName());
         if (null == brokerAddr) {
             tryToFindTopicPublishInfo(mq.getTopic());
@@ -721,6 +770,7 @@ public class DefaultMQProducerImpl implements MQProducerInner {
 
             byte[] prevBody = msg.getBody();
             try {
+                // step 2
                 //for MessageBatch,ID has been set in the generating process
                 if (!(msg instanceof MessageBatch)) {
                     MessageClientIDSetter.setUniqID(msg);
@@ -756,6 +806,7 @@ public class DefaultMQProducerImpl implements MQProducerInner {
                     this.executeCheckForbiddenHook(checkForbiddenContext);
                 }
 
+                // step 3
                 if (this.hasSendMessageHook()) {
                     context = new SendMessageContext();
                     context.setProducer(this);
@@ -777,6 +828,7 @@ public class DefaultMQProducerImpl implements MQProducerInner {
                     this.executeSendMessageHookBefore(context);
                 }
 
+                // step 4
                 SendMessageRequestHeader requestHeader = new SendMessageRequestHeader();
                 requestHeader.setProducerGroup(this.defaultMQProducer.getProducerGroup());
                 requestHeader.setTopic(msg.getTopic());
@@ -804,6 +856,7 @@ public class DefaultMQProducerImpl implements MQProducerInner {
                     }
                 }
 
+                // step 5
                 SendResult sendResult = null;
                 switch (communicationMode) {
                     case ASYNC:
@@ -865,6 +918,7 @@ public class DefaultMQProducerImpl implements MQProducerInner {
                         break;
                 }
 
+                // step 6
                 if (this.hasSendMessageHook()) {
                     context.setSendResult(sendResult);
                     this.executeSendMessageHookAfter(context);
@@ -954,6 +1008,10 @@ public class DefaultMQProducerImpl implements MQProducerInner {
         }
     }
 
+    /**
+     * 在消息发送后执行发送消息钩子
+     * @param context
+     */
     public void executeSendMessageHookAfter(final SendMessageContext context) {
         if (!this.sendMessageHookList.isEmpty()) {
             for (SendMessageHook hook : this.sendMessageHookList) {

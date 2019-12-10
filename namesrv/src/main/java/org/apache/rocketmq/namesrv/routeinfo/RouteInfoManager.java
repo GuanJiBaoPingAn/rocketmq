@@ -49,10 +49,20 @@ public class RouteInfoManager {
     private static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.NAMESRV_LOGGER_NAME);
     private final static long BROKER_CHANNEL_EXPIRED_TIME = 1000 * 60 * 2;
     private final ReadWriteLock lock = new ReentrantReadWriteLock();
+
+    /** Topic 消息队列路由信息，消息发送时根据路由表进行负载均衡 */
     private final HashMap<String/* topic */, List<QueueData>> topicQueueTable;
+
+    /** Broker 基础信息， 包含brokerName 、所属集群名称、主备Broker地址 */
     private final HashMap<String/* brokerName */, BrokerData> brokerAddrTable;
+
+    /** Broker 集群信息，存储集群中所有Broker 名称 */
     private final HashMap<String/* clusterName */, Set<String/* brokerName */>> clusterAddrTable;
+
+    /** Broker 状态信息。NameServer 每次收到心跳包时会替换该信息 */
     private final HashMap<String/* brokerAddr */, BrokerLiveInfo> brokerLiveTable;
+
+    /** Broker 上的FilterServer 列表，用于类模式消息过滤 */
     private final HashMap<String/* brokerAddr */, List<String>/* Filter Server */> filterServerTable;
 
     public RouteInfoManager() {
@@ -99,6 +109,28 @@ public class RouteInfoManager {
         return topicList.encode();
     }
 
+    /**
+     * 真实注册broker，缓存信息更新
+     * Step1：路由注册需要加写锁，防止并发修改RoutelnfoManager 中的路由表。首先判断Broker 所属集群是否存在， 如果不存在，则创建，
+     * 然后将broker 名加入到集群Broker 集合中。
+     * Step2：维护BrokerData 信息，首先从brokerAddrTable 根据BrokerName 尝试获取Broker 信息，如果不存在，则新建BrokerData 并
+     * 放入到brokerAddrTable, registerFirst 设置为true ；如果存在，直接替换原先的，registerFirst 设置为false，表示非第一次注册。
+     * Step3：如果Broker 为Master ，并且Broker Topic 配置信息发生变化或者是初次注册，则需要创建或更新Topic 路由元数据，填充
+     * topicQueueTable，其实就是为默认主题自动注册路由信息，其中包含MixAII.DEFAULTTOPIC 的路由信息。当消息生产者发送主题时，
+     * 如果该主题未创建并且BrokerConfig 的autoCreateTopicEnable 为true 时， 将返回MixAII.DEFAULTTOPIC 的路由信息。
+     * Step4：更新BrokerLivelnfo，存活Broker 信息表，BrokeLivelnfo 是执行路由删除的重要依据。
+     * Step5：注册Broker 的过滤器Server 地址列表，一个Broker 上会关联多个FilterServer 消息过滤服务器
+     *
+     * @param clusterName
+     * @param brokerAddr
+     * @param brokerName
+     * @param brokerId
+     * @param haServerAddr
+     * @param topicConfigWrapper
+     * @param filterServerList
+     * @param channel
+     * @return
+     */
     public RegisterBrokerResult registerBroker(
         final String clusterName,
         final String brokerAddr,
@@ -440,6 +472,18 @@ public class RouteInfoManager {
         }
     }
 
+    /**
+     * Step 1：申请写锁，根据brokerAddress 从brokerLiveTable、filterServerTable 移除
+     * Step 2：维护brokerAddrTable 。遍历HashMap<String, BrokerData> brokerAddrTable，从BrokerData 的
+     * HashMap<Long, String> brokerAddrs 中，找到具体的Broker，从BrokerData 中移除，如果移除后在BrokerData 中
+     * 不再包含其他Broker ，则在brokerAddrTable 中移除该brokerName 对应的条目
+     * Step 3：根据BrokerName，从clusterAddrTable 中找到Broker 并从集群中移除。如果移除后，集群中不包含任何Broker ，则将该集群从clusterAddrTable 中移除
+     * Step 4：根据brokerName，遍历所有主题的队列，如果队列中包含了当前Broker 的队列， 则移除，如果topic 只包含待移除Broker 的队列的话，从路由表中删除该topic
+     * Step5 ：释放锁，完成路由删除
+     *
+     * @param remoteAddr
+     * @param channel
+     */
     public void onChannelDestroy(String remoteAddr, Channel channel) {
         String brokerAddrFound = null;
         if (channel != null) {
@@ -752,6 +796,9 @@ public class RouteInfoManager {
     }
 }
 
+/**
+ * broker 的实时信息，上次更新状态的时间戳、
+ */
 class BrokerLiveInfo {
     private long lastUpdateTimestamp;
     private DataVersion dataVersion;

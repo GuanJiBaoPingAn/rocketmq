@@ -86,6 +86,12 @@ public class PullMessageService extends ServiceThread {
         }
     }
 
+    /**
+     * 1 ) while(!this.isStopped())这是一种通用的设计技巧，stopped 声明为volatile， 每执行一次业务逻辑检测一下其运行状态，可以通过
+     * 其他线程将stopped 设置为true 从而停止该线程
+     * 2 ）从pullRequestQueue 中获取一个PullRequest 消息拉取任务，如果pullRequestQueue为空，则线程将阻塞，直到有拉取任务被放入
+     * 3 ）调用pullMessage 方法进行消息拉取
+     */
     @Override
     public void run() {
         log.info(this.getServiceName() + " service started");

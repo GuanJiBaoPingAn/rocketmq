@@ -604,6 +604,23 @@ public class MQClientInstance {
         }
     }
 
+    /**
+     * 第一次发送消息时，本地没有缓存topic 的路由信息，查询NameServer 尝试获取，如果路由信息未找到，再次尝试用默认主题
+     * DefaultMQProducerlmpl#createTopicKey 去查询，如果BrokerConfig#autoCreateTopicEnable 为true 时， NameServer 将返回路由
+     * 信息，如果autoCreateTopicEnable为false 将抛出无法找到topic 路由异常
+     * Step 1：如果isDefault 为true ，则使用默认主题去查询，如果查询到路由信息，则替换路由信息中读写队列个数为消息生产者默认的队列
+     * 个数（defaultTopicQueueNums）；如果isDefault 为false，则使用参数topic 去查询；如果未查询到路由信息，则返回false ，表示
+     * 路由信息未变化
+     * Step 2：如果路由信息找到，与本地缓存中的路由信息进行对比，判断路由信息是否发生了改变，如果未发生变化，则直接返回false
+     * Step 3：更新MQClientInstance Broker 地址缓存表
+     * Step 4：根据topicRouteData 中的List<QueueData> 转换成问icPublis凶曲的List<MessageQueue> 列表。其具体实现在
+     * topicRouteData2TopicPublishInfo， 然后会更新该MQClientInstance所管辖的所有消息发送关于topic 的路由信息
+     *
+     * @param topic
+     * @param isDefault
+     * @param defaultMQProducer
+     * @return
+     */
     public boolean updateTopicRouteInfoFromNameServer(final String topic, boolean isDefault,
         DefaultMQProducer defaultMQProducer) {
         try {

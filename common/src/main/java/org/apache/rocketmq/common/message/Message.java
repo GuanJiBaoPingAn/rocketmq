@@ -22,6 +22,15 @@ import java.util.Collection;
 import java.util.HashMap;
 import java.util.Map;
 
+/**
+ * Message 的基础属性主要包括消息所属主题topic ， 消息Flag(RocketMQ 不做处理）、扩展属性、消息体
+ * Message 扩展属性主要包含下面几个。
+ *  tag ：消息TAG ，用于消息过滤。
+ *  keys: Message 索引键， 多个用空格隔开， RocketMQ 可以根据这些key 快速检索到消息。
+ *  waitStoreMsgOK ：消息发送时是否等消息存储完成后再返回。
+ *  delayTimeLevel ： 消息延迟级别，用于定时消息或消息重试。
+ *  这些扩展属性存储在Message 的properties 中。
+ */
 public class Message implements Serializable {
     private static final long serialVersionUID = 8445773977080406428L;
 

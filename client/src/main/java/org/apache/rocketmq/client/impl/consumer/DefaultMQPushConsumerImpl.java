@@ -210,7 +210,30 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
         this.offsetStore = offsetStore;
     }
 
+    /**
+     * Step 1 ：从PullRequest 中获取Process Queue，如果处理队列当前状态未被丢弃，则更新ProcessQueue 的lastPullTimestamp 为
+     * 当前时间戳；如果当前消费者被挂起，则将拉取任务延迟1s 再次放入到PullMessageService 的拉取任务队列中，结束本次消息拉取
+     * Step 2 ：进行消息拉取流控。从消息消费数量与消费间隔两个维度进行控制。
+     * 1 ）消息处理总数，如果ProcessQueue 当前处理的消息条数超过了pullThresholdForQueue=1OOO 将触发流控，放弃本次拉取任务，并且
+     * 该队列的下一次拉取任务将在50 毫秒后才加入到拉取任务队列中， 每触发1000 次流控后输出提示语： the consumer message buffer is
+     * full, so do flow control, minOffset=｛队列最小偏移量｝，maxOffset=｛队列最大偏移量｝，size＝｛消息总条数｝,
+     * pullRequest=｛拉取任务｝, flowControlTimes=｛流控触发次数｝ 。
+     * 2 ) ProcessQueue 中队列最大偏移量与最小偏离量的间距，不能超过consumeConcurrentlyMaxSpan，否则触发流控，每触发1000 次输出
+     * 提示语： the queue's messages, span too long, so do flow control, minOffset=｛队列最小偏移量｝，maxOffset=
+     * ｛队列最大偏移量｝，maxSpan＝｛间隔，pullRequest=｛拉取任务信息｝，flowControlTimes＝｛流控触发次数｝。这里主要的考量是担心一
+     * 条消息堵塞，消息进度无法向前推进，可能造成大量消息重复消费
+     * Step 3 ：拉取该主题订阅信息，如果为空，结束本次消息拉取，关于该队列的下一次拉取任务延迟3s
+     * Step 4 ：构建消息拉取系统标记
+     * Step 5 ：调用PullAPIWrapper.pullKernelImpl 方法后与服务端交互
+     * Step 6 ：根据brokerName 、BrokerId 从MQClientInstance 中获取Broker 地址，在整个RocketMQ Broker 的部署结构中，相同名称的
+     * Broker 构成主从结构，其BrokerId 会不一样，在每次拉取消息后，会给出一个建议，下次拉取从主节点还是从节点拉取
+     * Step 7 ：如果消息过滤模式为类过滤， 则需要根据主题名称、broker 地址找到注册在Broker 上的FilterServer 地址，从FilterServer
+     * 上拉取消息，否则从Broker 上拉取消息
+     *
+     * @param pullRequest
+     */
     public void pullMessage(final PullRequest pullRequest) {
+        // step 1
         final ProcessQueue processQueue = pullRequest.getProcessQueue();
         if (processQueue.isDropped()) {
             log.info("the pull request[{}] is dropped.", pullRequest.toString());
@@ -233,6 +256,7 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
             return;
         }
 
+        // step 2
         long cachedMessageCount = processQueue.getMsgCount().get();
         long cachedMessageSizeInMiB = processQueue.getMsgSize().get() / (1024 * 1024);
 
@@ -289,6 +313,7 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
             }
         }
 
+        // step 3
         final SubscriptionData subscriptionData = this.rebalanceImpl.getSubscriptionInner().get(pullRequest.getMessageQueue().getTopic());
         if (null == subscriptionData) {
             this.executePullRequestLater(pullRequest, pullTimeDelayMillsWhenException);
@@ -402,6 +427,7 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
             }
         };
 
+        // step 4
         boolean commitOffsetEnable = false;
         long commitOffsetValue = 0L;
         if (MessageModel.CLUSTERING == this.defaultMQPushConsumer.getMessageModel()) {
@@ -429,6 +455,7 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
             classFilter // class filter
         );
         try {
+            // step 5
             this.pullAPIWrapper.pullKernelImpl(
                 pullRequest.getMessageQueue(),
                 subExpression,
@@ -565,17 +592,34 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
         }
     }
 
+    /**
+     * Step 1 ：构建主题订阅信息SubscriptionData 并加入到RebalanceImpl 的订阅消息中。订
+     * 阅关系来源主要有两个。
+     * 1 ）通过调用DefaultMQPushConsumerImpl#subscribe（String topic, String subExpression)方法
+     * 2 ）订阅重试主题消息。从这里可以看出， RocketMQ 消息重试是以消费组为单位，而
+     * 不是主题，消息重试主题名为%RETRY%＋消费组名。消费者在启动的时候会自动订阅该
+     * 主题，参与该主题的消息队列负载
+     * Step 2 ：初始化MQClientInstance 、RebalanceImple （消息重新负载实现类）等
+     * Step 3 ： 初始化消息进度。如果消息消费是集群模式，那么消息进度保存在Broker 上；如果是广播模式，那么消息消费进度存储在消费端
+     * Step 4 ：根据是否是顺序消费，创建消费端消费线程服务。ConsumeMessageService 主要负责消息消费，内部维护一个线程池
+     * Step 5 ：向MQClientInstance 注册消费者，并启动MQClientInstance ， 在一个NM 中的
+     * 所有消费者、生产者持有同一个MQClientInstance, MQClientInstance 只会启动一次
+     *
+     * @throws MQClientException
+     */
     public synchronized void start() throws MQClientException {
         switch (this.serviceState) {
             case CREATE_JUST:
                 log.info("the consumer [{}] start beginning. messageModel={}, isUnitMode={}", this.defaultMQPushConsumer.getConsumerGroup(),
                     this.defaultMQPushConsumer.getMessageModel(), this.defaultMQPushConsumer.isUnitMode());
+                // step 1
                 this.serviceState = ServiceState.START_FAILED;
 
                 this.checkConfig();
 
                 this.copySubscription();
 
+                // step 2
                 if (this.defaultMQPushConsumer.getMessageModel() == MessageModel.CLUSTERING) {
                     this.defaultMQPushConsumer.changeInstanceNameToPID();
                 }
@@ -592,6 +636,7 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
                     this.defaultMQPushConsumer.getConsumerGroup(), isUnitMode());
                 this.pullAPIWrapper.registerFilterMessageHook(filterMessageHookList);
 
+                // step 3
                 if (this.defaultMQPushConsumer.getOffsetStore() != null) {
                     this.offsetStore = this.defaultMQPushConsumer.getOffsetStore();
                 } else {
@@ -609,6 +654,7 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
                 }
                 this.offsetStore.load();
 
+                // step 4
                 if (this.getMessageListenerInner() instanceof MessageListenerOrderly) {
                     this.consumeOrderly = true;
                     this.consumeMessageService =
@@ -621,6 +667,7 @@ public class DefaultMQPushConsumerImpl implements MQConsumerInner {
 
                 this.consumeMessageService.start();
 
+                // step 5
                 boolean registerOK = mQClientFactory.registerConsumer(this.defaultMQPushConsumer.getConsumerGroup(), this);
                 if (!registerOK) {
                     this.serviceState = ServiceState.CREATE_JUST;

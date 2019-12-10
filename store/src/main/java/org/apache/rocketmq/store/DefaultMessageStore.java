@@ -61,33 +61,48 @@ import org.apache.rocketmq.store.index.QueryOffsetResult;
 import org.apache.rocketmq.store.schedule.ScheduleMessageService;
 import org.apache.rocketmq.store.stats.BrokerStatsManager;
 
+/**
+ * 默认消息存储实现
+ */
 public class DefaultMessageStore implements MessageStore {
     private static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.STORE_LOGGER_NAME);
 
+    /** 消息存储配置属性 */
     private final MessageStoreConfig messageStoreConfig;
+
+    /** CommitLog 文件的存储实现类。 */
     // CommitLog
     private final CommitLog commitLog;
 
+    /** 消息队列存储缓存表，按消息主题分组 */
     private final ConcurrentMap<String/* topic */, ConcurrentMap<Integer/* queueId */, ConsumeQueue>> consumeQueueTable;
 
+    /** 消息队列文件ConsumeQueue 刷盘线程 */
     private final FlushConsumeQueueService flushConsumeQueueService;
 
+    /** 清除CommitLog 文件服务 */
     private final CleanCommitLogService cleanCommitLogService;
 
+    /** 清除ConsumeQueue 文件服务 */
     private final CleanConsumeQueueService cleanConsumeQueueService;
 
+    /** 索引文件实现类 */
     private final IndexService indexService;
 
+    /** MappedFile 分配服务 */
     private final AllocateMappedFileService allocateMappedFileService;
 
+    /** CommitLog 消息分发，根据CommitLog 文件构建ConsumeQueue 、IndexFile 文件 */
     private final ReputMessageService reputMessageService;
 
+    /** 存储HA 机制 */
     private final HAService haService;
 
     private final ScheduleMessageService scheduleMessageService;
 
     private final StoreStatsService storeStatsService;
 
+    /** 消息堆内存缓存 */
     private final TransientStorePool transientStorePool;
 
     private final RunningFlags runningFlags = new RunningFlags();
@@ -96,15 +111,21 @@ public class DefaultMessageStore implements MessageStore {
     private final ScheduledExecutorService scheduledExecutorService =
         Executors.newSingleThreadScheduledExecutor(new ThreadFactoryImpl("StoreScheduledThread"));
     private final BrokerStatsManager brokerStatsManager;
+
+    /** 消息拉取长轮询模式消息达到监听器 */
     private final MessageArrivingListener messageArrivingListener;
+
+    /** Broker 配置属性 */
     private final BrokerConfig brokerConfig;
 
     private volatile boolean shutdown = true;
 
+    /** 文件刷盘检测点 */
     private StoreCheckpoint storeCheckpoint;
 
     private AtomicLong printTimes = new AtomicLong(0);
 
+    /** CommitLog 文件转发请求 */
     private final LinkedList<CommitLogDispatcher> dispatcherList;
 
     private RandomAccessFile lockFile;
@@ -171,31 +192,53 @@ public class DefaultMessageStore implements MessageStore {
     }
 
     /**
+     * Step 1：判断上一次退出是否正常。其实现机制是Broker 在启动时创建${ROCKETT_HOME}/store/abort 文件，在退出时通过注册NM 钩子函数
+     * 删除abort 文件。如果下一次启动时存在abort 文件。说明Broker 是异常退出的，Commitlog 与Consumequeue 数据有可能不一致，需要进行修复
+     * Step 2：加载延迟队列， RocketMQ 定时消息相关
+     * Step 3：加载Commitlog 文件，加载${ROCKET_HOME }/store/commitlog 目录下所有文件并按照文件名排序。如果文件大小与配置文件的单个
+     * 文件大小不一致，将忽略该目录下所有文件， 然后创建MappedFile 对象。注意load 方法将wrotePosition、flushedPosition,
+     * committedPosition 三个指针都设置为文件大小
+     * Step 4：加载消息消费队列， 调用DefaultMessageStore#loadConsumeQueue ，其思路与CommitLog 大体一致， 遍历消息消费队列根目录，
+     * 获取该Broker 存储的所有主题，然后遍历每个主题目录，获取该主题下的所有消息消费队列， 然后分别加载每个消息消费队列下的文件， 构建
+     * ConsumeQueue 对象，主要初始化ConsumeQueue 的topic 、queueId、storePath 、mappedFileSize 属性
+     * Step 5：加载存储检测点，检测点主要记录commitlog 文件、Consumequeue 文件、Index 索引文件的刷盘点，将在下文的文件刷盘机制中再次提交
+     * Step 6：加载索引文件，如果上次异常退出，而且索引文件上次刷盘时间小于该索引文件最大的消息时间戳该文件将立即销毁
+     * Step 7：根据Broker 是否是正常停止执行不同的恢复策略，下文将分别介绍异常停止、正常停止的文件恢复机制
+     * Step 8：恢复ConsumeQueue 文件后，将在CommitLog 实例中保存每个消息消费队列当前的存储逻辑偏移量， 这也是消息中不仅存储主题、
+     * 消息队列ID 还存储了消息队列偏移量的关键所在
+     *
      * @throws IOException
      */
     public boolean load() {
         boolean result = true;
 
         try {
+            // step 1
             boolean lastExitOK = !this.isTempFileExist();
             log.info("last shutdown {}", lastExitOK ? "normally" : "abnormally");
 
+            // step 2
             if (null != scheduleMessageService) {
                 result = result && this.scheduleMessageService.load();
             }
 
+            // step 3
             // load Commit Log
             result = result && this.commitLog.load();
 
+            // step 4
             // load Consume Queue
             result = result && this.loadConsumeQueue();
 
             if (result) {
+                // step 5
                 this.storeCheckpoint =
                     new StoreCheckpoint(StorePathConfigHelper.getStoreCheckpoint(this.messageStoreConfig.getStorePathRootDir()));
 
+                // step 6
                 this.indexService.load(lastExitOK);
 
+                // step 7
                 this.recover(lastExitOK);
 
                 log.info("load over, and the max phy offset = {}", this.getMaxPhyOffset());
@@ -351,7 +394,38 @@ public class DefaultMessageStore implements MessageStore {
         }
     }
 
+    /**
+     * 消息发送存储
+     * Step 1：如果当前Broker 停止工作或Broker 为SLAVE 角色或当前Rocket 不支持写入则拒绝消息写入；如果消息主题长度超过256 个字符、
+     * 消息属性长度超过65536 个字符将拒绝该消息写人
+     * Step 2：如果消息的延迟级别大于0 ，将消息的原主题名称与原消息队列ID 存入消息属性中，用延迟消息主题SCHEDULE TOPIC 、消息队列ID
+     * 更新原先消息的主题与队列， 这是并发消息消费重试关键的一步，下一章会重点探讨消息重试机制与定时消息的实现原理
+     * Step 3：获取当前可以写入的Commitlog 文件
+     * Step 4：在写入CommitLog 之前，先申请putMessageLock，也就是将消息存储到CommitLog 文件中是串行的
+     * Step 5：设置消息的存储时间，如果rnappedFile 为空，表明$ {ROCKET_HOME}/store/commitlog 目录下不存在任何文件，说明本次消息
+     * 是第一次消息发送，用偏移量0 创建第一个commit 文件，文件为00000000000000000000 ，如果文件创建失败，抛出
+     * CREATE_MAPEDFILE_FAILED ，很有可能是磁盘空间不足或权限不够
+     * Step 6：将消息追加到MappedFile 中。首先先获取MappedFile 当前写指针，如果currentPos 大于或等于文件大小则表明文件已写满，
+     * 抛出AppendMessageStatus.UNKNOWN_ERROR。如果currentPos 小于文件大小，通过slice（）方法创建一个与MappedFile 的共享内
+     * 存区，并设置position 为当前指针
+     * Step 7：创建全局唯一消息ID ，消息ID 有16 字节
+     * Step 8： 获取该消息在消息队列的偏移量。CommitLog 中保存了当前所有消息队列的当前待写入偏移量
+     * Step 9： 根据消息、体的长度、主题的长度、属性的长度结合消息存储格式计算消息的总长度
+     * Step 10：如果消息长度＋END_FILE_ MIN_ BLANK_ LENGTH 大于CommitLog 文件的空闲空间，则返回AppendMessageStatus.END_OF FILE,
+     * Broker 会重新创建一个新的CommitLog 文件来存储该消息。从这里可以看出，每个CommitLog 文件最少会空闲8 个字节，高4 字节存储当前
+     * 文件剩余空间，低4 字节存储魔数： CommitLog.BLANK_MAGIC_CODE
+     * Step 11：将消息内容存储到ByteBuffer 中，然后创建AppendMessageResult 。这里只是将消息存储在MappedFile 对应的内存映射Buffer
+     * 中，并没有刷写到磁盘
+     * Step 12：更新消息队列逻辑偏移量
+     * Step 13：处理完消息追加逻辑后将释放putMessageLock 锁
+     * Step 14: DefaultAppendMessageCallback#doAppend 只是将消息追加在内存中， 需要根据是同步刷盘还是异步刷盘方式，将内存中的
+     * 数据持久化到磁盘
+     *
+     * @param msg Message instance to store
+     * @return
+     */
     public PutMessageResult putMessage(MessageExtBrokerInner msg) {
+        // step 1
         if (this.shutdown) {
             log.warn("message store has shutdown, so putMessage is forbidden");
             return new PutMessageResult(PutMessageStatus.SERVICE_NOT_AVAILABLE, null);
@@ -387,10 +461,12 @@ public class DefaultMessageStore implements MessageStore {
             return new PutMessageResult(PutMessageStatus.PROPERTIES_SIZE_EXCEEDED, null);
         }
 
+        // step 2
         if (this.isOSPageCacheBusy()) {
             return new PutMessageResult(PutMessageStatus.OS_PAGECACHE_BUSY, null);
         }
 
+        // step 3 4 5 6 7 8 9
         long beginTime = this.getSystemClock().now();
         PutMessageResult result = this.commitLog.putMessage(msg);
 
@@ -1221,7 +1297,7 @@ public class DefaultMessageStore implements MessageStore {
     }
 
     private void addScheduleTask() {
-
+        // RocketMQ 会每隔10s 调度一次cleanFilesPeriodically 检测是否需要清除过期文件。执行频率可以通过设置cleanResourceInterval，默认为10s
         this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
             @Override
             public void run() {
@@ -1424,8 +1500,18 @@ public class DefaultMessageStore implements MessageStore {
         }
     }
 
+    /**
+     * Step 1：根据消息主题与队列ID ，先获取对应的ConsumeQueue 文件，其逻辑比较简单，因为每一个消息主题对应一个消息消费队列目录然后
+     * 主题下每一个消息队列对应一个文件夹，然后取出该文件夹最后的ConsumeQueue 文件即可
+     * Step 2：依次将消息偏移量、消息长度、tag hash code 写入到ByteBuffer 中，并根据consumeQueueOffset 计算ConsumeQueue 中的物理
+     * 地址，将内容追加到ConsumeQueue 的内存映射文件中（本操作只追击并不刷盘），ConsumeQueue 的刷盘方式固定为异步刷盘模式
+     *
+     * @param dispatchRequest
+     */
     public void putMessagePositionInfo(DispatchRequest dispatchRequest) {
+        // step 1
         ConsumeQueue cq = this.findConsumeQueue(dispatchRequest.getTopic(), dispatchRequest.getQueueId());
+        // step 2
         cq.putMessagePositionInfoWrapper(dispatchRequest);
     }
 
@@ -1478,6 +1564,9 @@ public class DefaultMessageStore implements MessageStore {
         }, 6, TimeUnit.SECONDS);
     }
 
+    /**
+     * 消息消费队列转发任务实现类
+     */
     class CommitLogDispatcherBuildConsumeQueue implements CommitLogDispatcher {
 
         @Override
@@ -1495,6 +1584,9 @@ public class DefaultMessageStore implements MessageStore {
         }
     }
 
+    /**
+     * 根据消息更新Index 索引文件
+     */
     class CommitLogDispatcherBuildIndex implements CommitLogDispatcher {
 
         @Override
@@ -1536,8 +1628,13 @@ public class DefaultMessageStore implements MessageStore {
 
         private void deleteExpiredFiles() {
             int deleteCount = 0;
+            // 文件保留时间，也就是从最后一次更新时间到现在，如果超过了该时间，则认为是过期文件，可以被删除
             long fileReservedTime = DefaultMessageStore.this.getMessageStoreConfig().getFileReservedTime();
+            // 删除物理文件的间隔，因为在一次清除过程中，可能需要被删除的文件不止一个，该值指定两次删除文件的问隔时间
             int deletePhysicFilesInterval = DefaultMessageStore.this.getMessageStoreConfig().getDeleteCommitLogFilesInterval();
+            // 在清除过期文件时，如果该文件被其他线程所占用（引用次数大于0 ，比如读取消息），此时会阻止此次删除任务，同时在第一次试图删除该
+            // 文件时记录当前时间戳，destroyMappedFileIntervalForcibly 表示第一次拒绝删除之后能保留的最大时间，在此时间内，同样可以
+            // 被拒绝删除，同时会将引用减少1000 个，超过该时间间隔后，文件将被强制删除。
             int destroyMapedFileIntervalForcibly = DefaultMessageStore.this.getMessageStoreConfig().getDestroyMapedFileIntervalForcibly();
 
             boolean timeup = this.isTimeToDelete();
@@ -1774,6 +1871,9 @@ public class DefaultMessageStore implements MessageStore {
         }
     }
 
+    /**
+     *
+     */
     class ReputMessageService extends ServiceThread {
 
         private volatile long reputFromOffset = 0;
@@ -1811,7 +1911,15 @@ public class DefaultMessageStore implements MessageStore {
             return this.reputFromOffset < DefaultMessageStore.this.commitLog.getMaxOffset();
         }
 
+        /**
+         * Step 1：返回reputFromOffset 偏移量开始的全部有效数据（commitlog 文件）。然后循环读取每一条消息
+         * Step 2：从result 返回的ByteBuffer 中循环读取消息，一次读取一条，创建DispatchRequest对象。如果消息长度大于0 ，则调用
+         * doDispatch方法。最终将分别调用CommitLogDispatcherBuildConsumeQueue （构建消息消费队列）、
+         * CommitLogDispatcherBuildIndex （构建索引文件）
+         *
+         */
         private void doReput() {
+            // step 1
             if (this.reputFromOffset < DefaultMessageStore.this.commitLog.getMinOffset()) {
                 log.warn("The reputFromOffset={} is smaller than minPyOffset={}, this usually indicate that the dispatch behind too much and the commitlog has expired.",
                     this.reputFromOffset, DefaultMessageStore.this.commitLog.getMinOffset());
@@ -1824,6 +1932,7 @@ public class DefaultMessageStore implements MessageStore {
                     break;
                 }
 
+                // step 2
                 SelectMappedBufferResult result = DefaultMessageStore.this.commitLog.getData(reputFromOffset);
                 if (result != null) {
                     try {

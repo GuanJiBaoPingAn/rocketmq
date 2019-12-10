@@ -89,6 +89,27 @@ public class IndexFile {
         return this.mappedFile.destroy(intervalForcibly);
     }
 
+    /**
+     * 将消息索引键与消息偏移量映射关系写入到IndexFile
+     * Step 1：如果当前已使用条目大于等于允许最大条目数时，则返回fasle，表示当前索引文件已写满。如果当前索引文件未写满则根据key 算出
+     * key 的hash code ，然后keyHash 对hash 槽数量取余定位到hashcode 巳对应的hash 槽下标，hashcode 对应的hash 槽的物理地址
+     * 为IndexHeader 头部（40 字节）加上下标乘以每个hash 槽的大小（4 字节）
+     * Step 2：读取hash 槽中存储的数据，如果hash 槽存储的数据小于0 或大于当前索引文件中的索引条目格式，则将slotValue 设置为0
+     * Step 3：计算待存储消息的时间戳与第一条消息时间戳的差值，并转换成秒
+     * Step 4：将条目信息存储在IndexFile 中。
+     *  1 ）计算新添加条目的起始物理偏移量， 等于头部字节长度＋ hash 槽数量单个hash 槽大小（4 个字节）＋当前Index 条目个数单个Index
+     *   条目大小（20 个字节） 。
+     *  2 ）依次将hash cod巳、消息物理偏移量、消息存储时间戳与索引文件时间戳、当前 Hash 槽的值存入MappedByteBuffer 中。
+     *  3 ）将当前Index 中包含的条目数量存入Hash 槽中，将覆盖原先Hash 槽的值。
+     * Step 5： 更新文件索引头信息。如果当前文件只包含一个条目，更新beginPhyOffset 与 beginTimestamp 、更新
+     * endPyhOffset 、endTimestamp 、当前文件使用索引条目等信息。
+     *
+     *
+     * @param key
+     * @param phyOffset
+     * @param storeTimestamp
+     * @return
+     */
     public boolean putKey(final String key, final long phyOffset, final long storeTimestamp) {
         if (this.indexHeader.getIndexCount() < this.indexNum) {
             int keyHash = indexKeyHashMethod(key);
@@ -186,9 +207,28 @@ public class IndexFile {
         return result;
     }
 
+    /**
+     * 索引key 查找消息
+     * Step 1：根据key 算出key 的hashcode ，然后keyHash 对hash 槽数量取余定位到 hashcode 对应的hash 槽下标， hashcode 对应的
+     * hash 槽的物理地址为IndexHeader 头部（40字节）加上下标乘以每个hash 槽的大小（4 字节）
+     * Step 2：如果对应的Hash 槽中存储的数据小于1 或大于当前索引条目个数则表示该Hash Code 没有对应的条目，直接返回
+     * Step 3：由于会存在hash 冲突，根据slotValue 定位该hash 槽最新的一个Item 条目，将存储的物理偏移加入到phyOffsets 中，然后继续
+     * 验证Item 条目中存储的上一个Index 下标，如果大于等于1 并且小于最大条目数， 则继续查找， 否则结束查找
+     * Step 4：根据Index 下标定位到条目的起始物理偏移量，然后依次读取hashcode 、物理偏移量、时间差、上一个条目的Index 下标
+     * Step 5：如果存储的时间差小于0 ，则直接结束；如果hashcode 匹配并且消息存储时间介 于待查找时间start 、end 之间则将消息物理偏移量
+     * 加入到phyOffsets，并验证条目的前一个Index 索引，如果索引大于等于1 并且小于Index 条目数，则继续查找，否则结束整个查找
+     *
+     * @param phyOffsets
+     * @param key
+     * @param maxNum
+     * @param begin
+     * @param end
+     * @param lock
+     */
     public void selectPhyOffset(final List<Long> phyOffsets, final String key, final int maxNum,
         final long begin, final long end, boolean lock) {
         if (this.mappedFile.hold()) {
+            // step 1
             int keyHash = indexKeyHashMethod(key);
             int slotPos = keyHash % this.hashSlotNum;
             int absSlotPos = IndexHeader.INDEX_HEADER_SIZE + slotPos * hashSlotSize;
@@ -200,6 +240,7 @@ public class IndexFile {
                     // hashSlotSize, true);
                 }
 
+                // step 2
                 int slotValue = this.mappedByteBuffer.getInt(absSlotPos);
                 // if (fileLock != null) {
                 // fileLock.release();
@@ -209,11 +250,13 @@ public class IndexFile {
                 if (slotValue <= invalidIndex || slotValue > this.indexHeader.getIndexCount()
                     || this.indexHeader.getIndexCount() <= 1) {
                 } else {
+                    // step 3
                     for (int nextIndexToRead = slotValue; ; ) {
                         if (phyOffsets.size() >= maxNum) {
                             break;
                         }
 
+                        // step 4
                         int absIndexPos =
                             IndexHeader.INDEX_HEADER_SIZE + this.hashSlotNum * hashSlotSize
                                 + nextIndexToRead * indexSize;
@@ -224,6 +267,7 @@ public class IndexFile {
                         long timeDiff = (long) this.mappedByteBuffer.getInt(absIndexPos + 4 + 8);
                         int prevIndexRead = this.mappedByteBuffer.getInt(absIndexPos + 4 + 8 + 4);
 
+                        // step 5
                         if (timeDiff < 0) {
                             break;
                         }

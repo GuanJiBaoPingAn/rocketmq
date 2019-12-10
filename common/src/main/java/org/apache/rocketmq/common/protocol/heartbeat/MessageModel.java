@@ -21,14 +21,17 @@
 package org.apache.rocketmq.common.protocol.heartbeat;
 
 /**
+ * 消息模式
  * Message model
  */
 public enum MessageModel {
     /**
+     * 广播 一个消息被每个消费者消费
      * broadcast
      */
     BROADCASTING("BROADCASTING"),
     /**
+     * 集群 一个消息只被消费一次
      * clustering
      */
     CLUSTERING("CLUSTERING");

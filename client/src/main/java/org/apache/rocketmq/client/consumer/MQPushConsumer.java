@@ -22,6 +22,7 @@ import org.apache.rocketmq.client.consumer.listener.MessageListenerOrderly;
 import org.apache.rocketmq.client.exception.MQClientException;
 
 /**
+ * 推消费者
  * Push consumer
  */
 public interface MQPushConsumer extends MQConsumer {

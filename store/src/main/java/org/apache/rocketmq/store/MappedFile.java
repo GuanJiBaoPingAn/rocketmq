@@ -41,28 +41,62 @@ import org.apache.rocketmq.store.config.FlushDiskType;
 import org.apache.rocketmq.store.util.LibC;
 import sun.nio.ch.DirectBuffer;
 
+/**
+ * 内存映射文件
+ */
 public class MappedFile extends ReferenceResource {
+    /** 操作系统每页大小，默认4k */
     public static final int OS_PAGE_SIZE = 1024 * 4;
     protected static final InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.STORE_LOGGER_NAME);
 
+    /** 当前JVM 实例中MappedFile 虚拟内存 */
     private static final AtomicLong TOTAL_MAPPED_VIRTUAL_MEMORY = new AtomicLong(0);
 
+    /** 当前JVM 实例中MappedFile 对象个数 */
     private static final AtomicInteger TOTAL_MAPPED_FILES = new AtomicInteger(0);
+
+    /** 当前该文件的写指针，从0 开始（内存映射文件中的写指针） */
     protected final AtomicInteger wrotePosition = new AtomicInteger(0);
+
+    /** 当前文件的提交指针，如果开启transientStorePoolEnable， 则数据会存储在TransientStorePool 中，
+     * 然后提交到内存映射ByteBuffer 中， 再刷写到磁盘 */
     protected final AtomicInteger committedPosition = new AtomicInteger(0);
+
+    /** 刷写到磁盘指针，该指针之前的数据持久化到磁盘中 */
     private final AtomicInteger flushedPosition = new AtomicInteger(0);
+
+    /** 文件大小 */
     protected int fileSize;
+
+    /** 文件通道 */
     protected FileChannel fileChannel;
     /**
+     * 堆内存ByteBuffer ， 如果不为空，数据首先将存储在该Buffer 中， 然后提交到MappedFile 对应的内存映射文件Buffer 。
+     * transientStorePoolEnable 为true 时不为空
      * Message will put to here first, and then reput to FileChannel if writeBuffer is not null.
      */
     protected ByteBuffer writeBuffer = null;
+
+    /** 堆内存池， transientStorePoolEnable 为true时启用,表示内容先存储在堆外内存，然后通过Commit 线程将数据提交到内存映射Buffer
+     中，再通过Flush 线程将内存映射Buffer 中的数据持久化到磁盘中。 */
     protected TransientStorePool transientStorePool = null;
+
+    /** 文件名称 */
     private String fileName;
+
+    /** 该文件的初始偏移量 */
     private long fileFromOffset;
+
+    /** 物理文件 */
     private File file;
+
+    /** 物理文件对应的内存映射Buffer */
     private MappedByteBuffer mappedByteBuffer;
+
+    /** 文件最后一次内容写入时间 */
     private volatile long storeTimestamp = 0;
+
+    /** 是否是MappedFileQueue 队列中第一个文件 */
     private boolean firstCreateInQueue = false;
 
     public MappedFile() {
@@ -266,6 +300,11 @@ public class MappedFile extends ReferenceResource {
     }
 
     /**
+     * 将内存中的数据刷写到磁盘，永久存储在磁盘中
+     * 刷写磁盘，直接调用mappedByteBuffer 或fileChannel 的force 方法将内存中的数据持久化到磁盘，那么flushedPosition 应该等于
+     * MappedByteBuffer 中的写指针；如果writeBuffer 不为空， 则flushedPosition 应等于上一次commit 指针；因为上一次提交的数据就是
+     * 进入到MappedByteBuffer 中的数据；如果writeBuffer 为空，数据是直接进入到MappedByteBuffer, wrotePosition 代表的是
+     * MappedByteBuffer 中的指针，故设置flushedPosition 为wrotePosition
      * @return The current flushed position
      */
     public int flush(final int flushLeastPages) {
@@ -377,6 +416,15 @@ public class MappedFile extends ReferenceResource {
         return this.fileSize == this.wrotePosition.get();
     }
 
+    /**
+     * 查找pos 到当前最大可读之间的数据，由于在整个写入期间都未曾改变MappedByteBuffer 的指针，所以mappedByteBuffer.slice（）方法
+     * 返回的共享缓存区空间为整个MappedFile，然后通过设置byteBuffer 的position 为待查找的值，读取字节为当前可读字节长度，最终返回的
+     * ByteBuffer 的limit（ 可读最大长度）为size 。整个共享缓存区的容量为（ MappedFile#fileSize-pos ），故在操作
+     * SelectMappedBufferResult 不能对包含在里面的ByteBuffer 调用flip 方法。
+     * @param pos
+     * @param size
+     * @return
+     */
     public SelectMappedBufferResult selectMappedBuffer(int pos, int size) {
         int readPosition = getReadPosition();
         if ((pos + size) <= readPosition) {
@@ -414,6 +462,14 @@ public class MappedFile extends ReferenceResource {
         return null;
     }
 
+    /**
+     * 如果available 为true，表示MappedFile 当前可用，无须清理，返回false；如果资源已经被清除，返回true；如果是堆外内存，调用
+     * 堆外内存的cleanup 方法清除，维护MappedFile 类变量TOTAL_MAPPED_VIRTUAL_MEMORY 、TOTAL_MAPPED_FILES 并返回true，表示
+     * cleanupOver 为true
+     *
+     * @param currentRef
+     * @return
+     */
     @Override
     public boolean cleanup(final long currentRef) {
         if (this.isAvailable()) {
@@ -435,11 +491,26 @@ public class MappedFile extends ReferenceResource {
         return true;
     }
 
+    /**
+     * MappedFile 销毁
+     * Step 1：关闭MappedFile 。初次调用时this.available 为true ，设置avai lable 为false ，并设置初次关闭的时间戳
+     * （firstShutdownTimestamp）为当前时间戳， 然后调用release （）方法尝试释放资源， release 只有在引用次数小于1 的情况下才会释放
+     * 资源；如果引用次数大于0 ，对比当前时间与firstShutdownTimestamp ，如果已经超过了其最大拒绝存活期，每执行一次，将引用数减少1000
+     * ，直到引用数小于0 时通过执行realse 方法释放资源
+     * Step 2：判断是否清理完成，判断标准是引用次数小于等于0 并且cleanupOver 为true, cleanupOver 为true 的触发条件是release
+     * 成功将MappedByteBuffer 资源释放。稍后详细分析release 方法
+     * Step 3：关闭文件通道，删除物理文件
+     *
+     * @param intervalForcibly
+     * @return
+     */
     public boolean destroy(final long intervalForcibly) {
         this.shutdown(intervalForcibly);
 
+        // step 1
         if (this.isCleanupOver()) {
             try {
+                // step 2
                 this.fileChannel.close();
                 log.info("close file channel " + this.fileName + " OK");
 
@@ -471,6 +542,7 @@ public class MappedFile extends ReferenceResource {
     }
 
     /**
+     * 获取Mapped File 最大读指针
      * @return The max position which have valid data
      */
     public int getReadPosition() {

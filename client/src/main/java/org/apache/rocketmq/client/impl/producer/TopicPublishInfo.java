@@ -23,11 +23,22 @@ import org.apache.rocketmq.common.message.MessageQueue;
 import org.apache.rocketmq.common.protocol.route.QueueData;
 import org.apache.rocketmq.common.protocol.route.TopicRouteData;
 
+/**
+ * 主题的路由信息
+ */
 public class TopicPublishInfo {
+    /** 是否是顺序消息 */
     private boolean orderTopic = false;
+
+    /**  */
     private boolean haveTopicRouterInfo = false;
+
+    /** 该主题队列的消息队列 */
     private List<MessageQueue> messageQueueList = new ArrayList<MessageQueue>();
+
+    /** 每选择一次消息队列， 该值会自增1 ，如果Integer.MAX_VALUE，则重置为0 ，用于选择消息队列 */
     private volatile ThreadLocalIndex sendWhichQueue = new ThreadLocalIndex();
+
     private TopicRouteData topicRouteData;
 
     public boolean isOrderTopic() {
@@ -66,6 +77,13 @@ public class TopicPublishInfo {
         this.haveTopicRouterInfo = haveTopicRouterInfo;
     }
 
+    /**
+     * 选择消息队列有两种方式。
+     * 1 ) sendLatencyFaultEnable=false ，默认不启用Broker 故障延迟机制。
+     * 2 ) sendLatencyFaultEnable=true ，启用Broker 故障延迟机制。
+     * @param lastBrokerName 上一次选择的执行发送消息失败的Broker，第一次执行该方法时为{@code null}
+     * @return
+     */
     public MessageQueue selectOneMessageQueue(final String lastBrokerName) {
         if (lastBrokerName == null) {
             return selectOneMessageQueue();

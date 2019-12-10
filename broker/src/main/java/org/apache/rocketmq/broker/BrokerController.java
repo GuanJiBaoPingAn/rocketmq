@@ -887,8 +887,8 @@ public class BrokerController {
             this.registerBrokerAll(true, false, true);
         }
 
+        // Broker 启动时向集群中所有的NameServ巳r 发送心跳语句，每隔3 0s 向集群中所有NameServer 发送心跳包
         this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
-
             @Override
             public void run() {
                 try {

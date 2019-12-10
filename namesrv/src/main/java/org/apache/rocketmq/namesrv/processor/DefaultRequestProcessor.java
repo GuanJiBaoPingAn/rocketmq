@@ -16,8 +16,10 @@
  */
 package org.apache.rocketmq.namesrv.processor;
 
+import io.netty.channel.Channel;
 import io.netty.channel.ChannelHandlerContext;
 import java.io.UnsupportedEncodingException;
+import java.util.List;
 import java.util.Properties;
 import java.util.concurrent.atomic.AtomicLong;
 import org.apache.rocketmq.common.DataVersion;
@@ -57,6 +59,9 @@ import org.apache.rocketmq.remoting.exception.RemotingCommandException;
 import org.apache.rocketmq.remoting.netty.NettyRequestProcessor;
 import org.apache.rocketmq.remoting.protocol.RemotingCommand;
 
+/**
+ * nameserver 的默认请求处理器
+ */
 public class DefaultRequestProcessor implements NettyRequestProcessor {
     private static InternalLogger log = InternalLoggerFactory.getLogger(LoggerName.NAMESRV_LOGGER_NAME);
 
@@ -274,6 +279,13 @@ public class DefaultRequestProcessor implements NettyRequestProcessor {
         return response;
     }
 
+    /**
+     * 处理broker 注册和心跳请求，请求最终转发到{@link org.apache.rocketmq.namesrv.routeinfo.RouteInfoManager#registerBroker(String, String, String, long, String, TopicConfigSerializeWrapper, List, Channel)}
+     * @param ctx
+     * @param request
+     * @return
+     * @throws RemotingCommandException
+     */
     public RemotingCommand registerBroker(ChannelHandlerContext ctx,
         RemotingCommand request) throws RemotingCommandException {
         final RemotingCommand response = RemotingCommand.createResponseCommand(RegisterBrokerResponseHeader.class);
@@ -334,6 +346,17 @@ public class DefaultRequestProcessor implements NettyRequestProcessor {
         return response;
     }
 
+    /**
+     * Step 1：调用RouterlnfoManager 的方法，从路由表topicQueueTable、brokerAddrTable、 filterServerTable 中分别填充
+     * TopicRouteData 中的List<QueueData＞、List<BrokerData＞和 filterServer 地址表
+     * Step 2：如果找到主题对应的路由信息并且该主题为顺序消息，则从NameServer KVconfig 中获取关于顺序消息相关的配置填充路由信息
+     * 如果找不到路由信息CODE 则使用TOPIC_NOT_EXISTS ，表示没有找到对应的路由
+     *
+     * @param ctx
+     * @param request
+     * @return
+     * @throws RemotingCommandException
+     */
     public RemotingCommand getRouteInfoByTopic(ChannelHandlerContext ctx,
         RemotingCommand request) throws RemotingCommandException {
         final RemotingCommand response = RemotingCommand.createResponseCommand(null);

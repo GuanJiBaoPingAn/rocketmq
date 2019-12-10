@@ -73,6 +73,13 @@ public class NamesrvController {
         this.configuration.setStorePathFromConfig(this.namesrvConfig, "configStorePath");
     }
 
+    /**
+     * 加载KV 配置，创建NettyServer 网络处理对象，然后开启两个定时任务，在RocketMQ
+     * 中此类定时任务统称为心跳检测
+     * 定时任务I: NameServer 每隔IOs 扫描一次Broker ， 移除处于不激活状态的Broker
+     * 定时任务2: nameserver 每隔10 分钟打印一次KV 配置
+     * @return
+     */
     public boolean initialize() {
 
         this.kvConfigManager.load();
@@ -84,6 +91,7 @@ public class NamesrvController {
 
         this.registerProcessor();
 
+        // 移除不激活状态的broker
         this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
 
             @Override
@@ -92,6 +100,7 @@ public class NamesrvController {
             }
         }, 5, 10, TimeUnit.SECONDS);
 
+        // 每隔10 分钟打印一次KV 配置
         this.scheduledExecutorService.scheduleAtFixedRate(new Runnable() {
 
             @Override

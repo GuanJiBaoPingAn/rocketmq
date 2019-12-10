@@ -152,9 +152,22 @@ public class ConsumeQueue {
         }
     }
 
+    /**
+     * 根据消息存储时间来查找
+     * Step 1：首先根据时间戳定位到物理文件，其具体实现在前面有详细介绍，就是从第一个文件开始找到第一个文件更新时间大于该时间戳的文件
+     * Step 2：采用二分查找来加速检索。首先计算最低查找偏移量，取消息队列最小偏移量与该文件最小偏移量二者中的最小偏移量为low 。获取当前
+     * 存储文件中有效的最小消息物理偏移量minPhysicOffset ，如果查找到消息偏移量小于该物理偏移量， 则结束该查找过程
+     * Step 3：如果targetOffset 不等于-1 表示找到了存储时间戳等于待查找时间戳的消息；如果leftIndexValue等于-1，表示返回当前时间戳大
+     * 并且最接近待查找的偏移量；如果rightIndexValue 等于-1 ， 表示返回的消息比待查找时间戳小并且最接近查找的偏移量
+     *
+     * @param timestamp
+     * @return
+     */
     public long getOffsetInQueueByTime(final long timestamp) {
+        // step 1
         MappedFile mappedFile = this.mappedFileQueue.getMappedFileByTime(timestamp);
         if (mappedFile != null) {
+            // step 2
             long offset = 0;
             int low = minLogicOffset > mappedFile.getFileFromOffset() ? (int) (minLogicOffset - mappedFile.getFileFromOffset()) : 0;
             int high = 0;
@@ -195,6 +208,7 @@ public class ConsumeQueue {
                         }
                     }
 
+                    // step 3
                     if (targetOffset != -1) {
 
                         offset = targetOffset;
